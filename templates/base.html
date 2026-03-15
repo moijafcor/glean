@@ -111,19 +111,18 @@
       modelSelect.addEventListener("change", syncFormHidden);
       syncFormHidden();
 
-      function appendBubble(role, text) {
+      function appendQaPair(question) {
         const wrap = document.createElement("div");
         wrap.className = "qa-pair";
-        const bubble = document.createElement("div");
-        bubble.className = "bubble " + role;
-        if (role === "user") {
-          bubble.textContent = text;
-        } else {
-          bubble.innerHTML = text ? marked.parse(text) : "";
-        }
-        wrap.appendChild(bubble);
+        const userBubble = document.createElement("div");
+        userBubble.className = "bubble user";
+        userBubble.textContent = question;
+        const assistantBubble = document.createElement("div");
+        assistantBubble.className = "bubble assistant";
+        wrap.appendChild(userBubble);
+        wrap.appendChild(assistantBubble);
         chatOutput.appendChild(wrap);
-        return bubble;
+        return assistantBubble;
       }
 
       function renderSources(container, sources) {
@@ -151,10 +150,8 @@
         const formData = new FormData(this);
         const question = formData.get("question");
         if (!question || !question.trim()) return;
-        appendBubble("user", question.trim());
+        const answerDiv = appendQaPair(question.trim());
         this.reset();
-
-        const answerDiv = appendBubble("assistant", "");
         const sourcesDiv = document.createElement("div");
         sourcesDiv.className = "sources hidden";
 
