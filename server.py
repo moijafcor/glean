@@ -7,7 +7,6 @@ import asyncio
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from queue import Queue

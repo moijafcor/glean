@@ -2,6 +2,7 @@
 # Install: pip install -r requirements-gui.txt
 
 fastapi
+jinja2
 uvicorn[standard]
 python-multipart
 chromadb
