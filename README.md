@@ -59,6 +59,22 @@ python3 glean.py -i
 
 ---
 
+## Web GUI
+
+A local web interface (FastAPI + HTMX) is available. No build step, no npm.
+
+```bash
+# Install GUI dependencies (once)
+pip install -r requirements-gui.txt
+
+# Start the server (default port 7777)
+python3 server.py
+```
+
+Then open `http://localhost:7777`. Use `GLEAN_CONFIG` and `GLEAN_PORT` to override config path and port.
+
+---
+
 ## Configuration
 
 glean is configured via a YAML file. By default it looks for `glean.yaml` in the current directory. Use `--config` to specify a different path.

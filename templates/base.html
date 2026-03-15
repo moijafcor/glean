@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>glean</title>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>glean</h1>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <section class="sidebar-section">
+        <label for="collection">Collection</label>
+        <select id="collection" name="collection">
+          <option value="">All</option>
+          {% for c in collections %}
+          <option value="{{ c }}">{{ c }}</option>
+          {% endfor %}
+        </select>
+      </section>
+
+      <section class="sidebar-section">
+        <label for="model">Model</label>
+        <select id="model" name="model">
+          <option value="{{ generation_model }}" selected>{{ generation_model }}</option>
+        </select>
+      </section>
+
+      <hr class="sidebar-hr" />
+
+      <section class="sidebar-section">
+        <span class="sidebar-label">Index</span>
+        <div class="button-row">
+          <button type="button"
+                  class="btn btn-primary"
+                  hx-post="/index"
+                  hx-target="#status-panel"
+                  hx-include="[name='collection']"
+                  hx-indicator="#index-spinner"
+                  hx-swap="innerHTML">
+            ▶ Update
+          </button>
+          <button type="button"
+                  class="btn btn-secondary"
+                  hx-post="/reindex"
+                  hx-target="#status-panel"
+                  hx-include="[name='collection']"
+                  hx-indicator="#index-spinner"
+                  hx-swap="innerHTML">
+            ↺ Re-index
+          </button>
+          <button type="button"
+                  class="btn btn-outline"
+                  hx-get="/status"
+                  hx-target="#status-panel"
+                  hx-indicator="#index-spinner"
+                  hx-swap="innerHTML">
+            ● Status
+          </button>
+        </div>
+        <div id="index-spinner" class="htmx-indicator spinner" aria-hidden="true"></div>
+      </section>
+
+      <hr class="sidebar-hr" />
+
+      <section class="sidebar-section status-section">
+        <span class="sidebar-label">Status</span>
+        <div id="status-panel"
+             hx-get="/status"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span class="muted">Loading…</span>
+        </div>
+      </section>
+    </aside>
+
+    <main class="chat-panel">
+      <div id="chat-output" class="chat-output">
+        {% include "chat.html" %}
+      </div>
+
+      <form id="ask-form" class="ask-form" method="post" action="/ask">
+        <input type="hidden" name="collection" id="form-collection" value="" />
+        <input type="hidden" name="model" id="form-model" value="{{ generation_model }}" />
+        <textarea name="question" id="question" rows="2" placeholder="Ask anything…" required></textarea>
+        <button type="submit" id="ask-btn">Ask →</button>
+      </form>
+    </main>
+  </div>
+
+  <script>
+    (function() {
+      const form = document.getElementById("ask-form");
+      const chatOutput = document.getElementById("chat-output");
+      const collectionSelect = document.getElementById("collection");
+      const modelSelect = document.getElementById("model");
+      const formCollection = document.getElementById("form-collection");
+      const formModel = document.getElementById("form-model");
+
+      function syncFormHidden() {
+        formCollection.value = collectionSelect.value || "";
+        formModel.value = modelSelect.value || "";
+      }
+      collectionSelect.addEventListener("change", syncFormHidden);
+      modelSelect.addEventListener("change", syncFormHidden);
+      syncFormHidden();
+
+      function appendBubble(role, text) {
+        const wrap = document.createElement("div");
+        wrap.className = "qa-pair";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble " + role;
+        if (role === "user") {
+          bubble.textContent = text;
+        } else {
+          bubble.innerHTML = text ? marked.parse(text) : "";
+        }
+        wrap.appendChild(bubble);
+        chatOutput.appendChild(wrap);
+        return bubble;
+      }
+
+      function renderSources(container, sources) {
+        container.innerHTML = "";
+        if (!Array.isArray(sources) || sources.length === 0) return;
+        const label = document.createElement("span");
+        label.className = "sources-label";
+        label.textContent = "Sources: ";
+        container.appendChild(label);
+        sources.forEach(function(s) {
+          const chip = document.createElement("span");
+          chip.className = "source-chip";
+          chip.title = s.path || "";
+          chip.textContent = s.file + ":" + s.start + "-" + s.end;
+          const em = document.createElement("em");
+          em.textContent = " (" + (s.collection || "") + ", " + (s.language || "") + ")";
+          chip.appendChild(em);
+          container.appendChild(chip);
+        });
+      }
+
+      form.addEventListener("submit", async function(e) {
+        e.preventDefault();
+        const formData = new FormData(this);
+        const question = formData.get("question");
+        if (!question || !question.trim()) return;
+
+        syncFormHidden();
+        appendBubble("user", question.trim());
+        this.reset();
+
+        const answerDiv = appendBubble("assistant", "");
+        const sourcesDiv = document.createElement("div");
+        sourcesDiv.className = "sources hidden";
+
+        let buffer = "";
+        let lastEvent = "";
+        const askBtn = document.getElementById("ask-btn");
+        if (askBtn) askBtn.disabled = true;
+
+        try {
+          const response = await fetch("/ask", { method: "POST", body: formData });
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let pending = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            pending += decoder.decode(value, { stream: true });
+            const lines = pending.split("\n");
+            pending = lines.pop() || "";
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              if (line.startsWith("event:")) {
+                lastEvent = line.slice(6).trim();
+                continue;
+              }
+              if (line.startsWith("data:")) {
+                const payload = line.slice(5).trim();
+                if (lastEvent === "sources") {
+                  try {
+                    const data = JSON.parse(payload);
+                    if (Array.isArray(data)) renderSources(sourcesDiv, data);
+                  } catch (err) {}
+                  lastEvent = "";
+                  continue;
+                }
+                if (payload === "") continue;
+                try {
+                  const data = JSON.parse(payload);
+                  if (data && data.token) {
+                    buffer += data.token;
+                    answerDiv.innerHTML = marked.parse(buffer);
+                    answerDiv.scrollIntoView({ behavior: "smooth", block: "end" });
+                  }
+                } catch (err) {}
+              }
+            }
+          }
+
+          if (pending.startsWith("data:")) {
+            const payload = pending.slice(5).trim();
+            try {
+              const data = JSON.parse(payload);
+              if (Array.isArray(data)) renderSources(sourcesDiv, data);
+            } catch (err) {}
+          }
+        } finally {
+          if (askBtn) askBtn.disabled = false;
+        }
+
+        answerDiv.parentElement.appendChild(sourcesDiv);
+        sourcesDiv.classList.remove("hidden");
+        answerDiv.scrollIntoView({ behavior: "smooth", block: "end" });
+      });
+
+      document.body.addEventListener("htmx:beforeRequest", function(ev) {
+        if (ev.detail.pathInfo.requestPath === "/index" || ev.detail.pathInfo.requestPath === "/reindex") {
+          var btns = document.querySelectorAll(".sidebar-section button[hx-post]");
+          btns.forEach(function(b) { b.disabled = true; });
+        }
+      });
+      document.body.addEventListener("htmx:afterRequest", function(ev) {
+        if (ev.detail.pathInfo.requestPath === "/index" || ev.detail.pathInfo.requestPath === "/reindex") {
+          var btns = document.querySelectorAll(".sidebar-section button[hx-post], .sidebar-section button[hx-get]");
+          btns.forEach(function(b) { b.disabled = false; });
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{# Fragment structure for a single Q&A pair (reference for JS-built DOM) #}
+<div class="qa-pair">
+  <div class="bubble user">{{ question }}</div>
+  <div class="bubble assistant"><!-- streamed Markdown here --></div>
+  <div class="sources">
+    {% for s in sources %}
+    <span class="source-chip" title="{{ s.path }}">
+      {{ s.file }}:{{ s.start }}-{{ s.end }}
+      <em>({{ s.collection }}, {{ s.language }})</em>
+    </span>
+    {% endfor %}
+  </div>
+</div>

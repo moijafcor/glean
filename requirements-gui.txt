@@ -1,0 +1,10 @@
+# Dependencies for the glean Web GUI (server.py)
+# Install: pip install -r requirements-gui.txt
+
+fastapi
+uvicorn[standard]
+python-multipart
+chromadb
+ollama
+pyyaml
+rich

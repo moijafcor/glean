@@ -1,0 +1,27 @@
+<div class="status-table-wrap">
+  <table class="status-table">
+    <thead>
+      <tr>
+        <th>Collection</th>
+        <th>Files</th>
+        <th>Chunks</th>
+        <th>Last indexed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.name }}</td>
+        <td>{{ r.files }}</td>
+        <td>{{ r.chunks }}</td>
+        <td>{{ r.last_indexed }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="status-summary">
+    <strong>{{ total_chunks }}</strong> chunks across <strong>{{ rows|length }}</strong> collection(s).
+    {% if embedding_model %}Embedding: {{ embedding_model }}.{% endif %}
+    {% if generation_model %}Generation: {{ generation_model }}.{% endif %}
+  </p>
+</div>
