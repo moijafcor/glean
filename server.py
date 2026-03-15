@@ -33,6 +33,21 @@ CONFIG_PATH = os.environ.get("GLEAN_CONFIG", str(BASE_DIR / "glean.yaml"))
 cfg = glean_lib.load_config(CONFIG_PATH)
 chroma_client = glean_lib.get_chroma_client(glean_lib.expand_path(cfg["state_dir"]))
 
+glean_lib._set_ollama_host(cfg["ollama_url"])
+try:
+    _models_resp = ollama.list()
+    _model_list = _models_resp.get("models") if isinstance(_models_resp, dict) else getattr(_models_resp, "models", [])
+    AVAILABLE_MODELS: list[str] = sorted(
+        (m.get("name") if isinstance(m, dict) else getattr(m, "model", None) or getattr(m, "name", None))
+        for m in (_model_list or [])
+        if (m.get("name") if isinstance(m, dict) else getattr(m, "model", None) or getattr(m, "name", None))
+    )
+except Exception:
+    AVAILABLE_MODELS = []
+
+if not AVAILABLE_MODELS:
+    AVAILABLE_MODELS = [cfg.get("generation_model", "qwen2.5-coder:7b")]
+
 
 def _run_ollama_stream(model: str, system: str, user_content: str, token_queue: Queue) -> None:
     """Run blocking ollama stream in a thread; push tokens into token_queue."""
@@ -68,6 +83,7 @@ async def index(request: Request):
             "request": request,
             "collections": collections,
             "generation_model": cfg.get("generation_model", "qwen2.5-coder:7b"),
+            "available_models": AVAILABLE_MODELS,
         },
     )
 
