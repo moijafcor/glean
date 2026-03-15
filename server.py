@@ -117,7 +117,7 @@ async def ask(request: Request):
 
         # 2. Stream LLM tokens from a background thread via queue
         token_queue = Queue()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut = loop.run_in_executor(
             None,
             _run_ollama_stream,
