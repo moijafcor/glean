@@ -76,6 +76,10 @@ async def index(request: Request):
 async def ask(request: Request):
     form = await request.form()
     question = (form.get("question") or "").strip()
+    if not question:
+        async def _empty():
+            yield "event: done\ndata: \n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
     collection = form.get("collection") or None
     model = form.get("model") or cfg.get("generation_model", "qwen2.5-coder:7b")
 
