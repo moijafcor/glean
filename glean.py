@@ -168,10 +168,10 @@ def matches_any(path: str, patterns: Sequence[str]) -> bool:
     """Return True if *path* (relative, using forward slashes) matches any pattern."""
     for pat in patterns:
         if pat.endswith("/"):
-            # directory exclusion: match any path component, not just the last segment
-            dir_name = pat.rstrip("/")
+            # directory exclusion: glob-match against every directory component
+            dir_pat = pat.rstrip("/")
             parts = path.replace("\\", "/").split("/")
-            if dir_name in parts[:-1]:  # any directory component, not the filename
+            if any(fnmatch.fnmatch(part, dir_pat) for part in parts[:-1]):
                 return True
         if fnmatch.fnmatch(os.path.basename(path), pat) or fnmatch.fnmatch(path, pat):
             return True
@@ -206,7 +206,10 @@ def discover_files(
             for fname in filenames:
                 abs_path = os.path.join(dirpath, fname)
                 rel = os.path.relpath(abs_path, root_path)
-                if os.path.getsize(abs_path) > 500 * 1024:
+                try:
+                    if os.path.getsize(abs_path) > 500 * 1024:
+                        continue
+                except OSError:
                     continue
                 if _is_secret_file(fname):
                     continue
@@ -645,10 +648,16 @@ def _set_ollama_host(ollama_url: str) -> None:
     os.environ.setdefault("OLLAMA_HOST", ollama_url)
 
 
+# nomic-embed-text caps at 8192 tokens. Content with many special characters
+# (JSON, shell globs, regexes) can approach 1 token/char, so we cap well below
+# the theoretical maximum. 3000 chars is safe for all observed content types.
+_EMBED_MAX_CHARS = 3000
+
+
 def embed_texts(model: str, texts: Sequence[str], batch_size: int = 32) -> List[List[float]]:
     embeddings: List[List[float]] = []
     for i in range(0, len(texts), batch_size):
-        batch = list(texts[i : i + batch_size])
+        batch = [t[:_EMBED_MAX_CHARS] for t in texts[i : i + batch_size]]
         resp = ollama.embed(model=model, input=batch)
         # Support both typed response objects and plain dicts
         if hasattr(resp, "embeddings"):
@@ -710,19 +719,28 @@ def index_collection(
     to_update: List[Tuple[str, str]] = []
     deleted_chunk_ids: List[str] = []
 
-    existing_paths = set(index_state.files.keys())
+    # Scope existing_paths to only files under this collection's roots,
+    # so we don't clobber other collections' state when detecting deletions.
+    coll_roots = tuple(expand_path(p) for p in cfg["collections"][collection_name]["paths"])
+    existing_paths = {
+        fp for fp in index_state.files
+        if fp.startswith(coll_roots)
+    }
     current_paths: set[str] = set()
 
     for abs_path, rel_path in files:
+        try:
+            mtime = os.path.getmtime(abs_path)
+        except OSError:
+            continue
         current_paths.add(abs_path)
-        mtime = os.path.getmtime(abs_path)
         entry = index_state.files.get(abs_path)
         if reindex or entry is None:
             to_add.append((abs_path, rel_path))
         elif entry.mtime != mtime:
             to_update.append((abs_path, rel_path))
 
-    # Deleted files
+    # Deleted files (only within this collection's roots)
     for abs_path in list(existing_paths):
         if abs_path not in current_paths:
             entry = index_state.files.pop(abs_path, None)
@@ -746,8 +764,12 @@ def index_collection(
     total_updated = 0
 
     for abs_path, rel_path in to_add + to_update:
-        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as exc:
+            console.print(f"[yellow]Skipping unreadable file:[/yellow] {abs_path} ({exc})")
+            continue
         chunks = chunk_file_contents(abs_path, text)
         if not chunks:
             continue

@@ -16,3 +16,85 @@ collections:
       - "*.yml"
     exclude:
       - ".git/"
+
+  starshot:
+    paths:
+      - ~/starshot/arrow_acquisition
+      - ~/starshot/champion
+      - ~/starshot/formula_win
+      - ~/starshot/intelligenz
+      - ~/starshot/maverick
+      - ~/starshot/payloads
+      - ~/starshot/sop
+      - ~/starshot/spotlight
+      - ~/starshot/triple_blitz
+    include:
+      - "*.py"
+      - "*.php"
+      - "*.ts"
+      - "*.tsx"
+      - "*.js"
+      - "*.jsx"
+      - "*.md"
+      - "*.yaml"
+      - "*.yml"
+      - "*.json"
+      - "*.sh"
+    exclude:
+      - ".git/"
+      - "node_modules/"
+      - "vendor/"
+      - "dist/"
+      - "build/"
+      - ".next/"
+      - "venv/"
+      - ".venv*/"
+      - "storage/"
+      - "bootstrap/cache/"
+      - "public/build/"
+      - "tests/"
+      - "*.min.js"
+      - "package-lock.json"
+      - "yarn.lock"
+      - "composer.lock"
+
+  code:
+    paths:
+      - ~/code/ansible-playbooks
+      - ~/code/app.fitter.live
+      - ~/code/app.jalalio.com
+      - ~/code/app.pollzapper.com
+      - ~/code/app.yotober.com
+      - ~/code/aprenter.com
+      - ~/code/diskpulse
+      - ~/code/moilab
+    include:
+      - "*.py"
+      - "*.php"
+      - "*.ts"
+      - "*.tsx"
+      - "*.js"
+      - "*.jsx"
+      - "*.md"
+      - "*.yaml"
+      - "*.yml"
+      - "*.json"
+      - "*.sh"
+      - "*.conf"
+    exclude:
+      - ".git/"
+      - "node_modules/"
+      - "vendor/"
+      - "dist/"
+      - "build/"
+      - ".next/"
+      - "venv/"
+      - ".venv*/"
+      - "storage/"
+      - "bootstrap/cache/"
+      - "public/build/"
+      - "tests/"
+      - "*.min.js"
+      - "package-lock.json"
+      - "yarn.lock"
+      - "composer.lock"
