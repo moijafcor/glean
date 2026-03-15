@@ -147,11 +147,10 @@
 
       form.addEventListener("submit", async function(e) {
         e.preventDefault();
+        syncFormHidden();
         const formData = new FormData(this);
         const question = formData.get("question");
         if (!question || !question.trim()) return;
-
-        syncFormHidden();
         appendBubble("user", question.trim());
         this.reset();
 
