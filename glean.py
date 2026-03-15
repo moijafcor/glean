@@ -20,17 +20,14 @@ import json
 import os
 import re
 import sys
-import textwrap
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import chromadb
 import ollama
 import yaml
-from chromadb.config import Settings
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
@@ -102,19 +99,20 @@ class IndexState:
             json.dump(raw, f, indent=2, sort_keys=True)
 
 
-@dataclass
-class QueryResult:
-    answer: str
-    sources: List[ChunkMetadata]
-    raw_chunks: List[str]
-
-
 # -----------------------------
 # Config Loading
 # -----------------------------
 
 
 DEFAULT_CONFIG_PATH = "glean.yaml"
+
+# Files that are likely to contain secrets and should never be indexed
+_SECRET_FILENAME_PATTERNS = {
+    ".env", "*.env", ".env.*",
+    "*.pem", "*.key", "*.p12", "*.pfx",
+    "id_rsa", "id_ecdsa", "id_ed25519", "id_dsa",
+    "credentials.json", "secrets.yaml", "secrets.yml",
+}
 
 
 def expand_path(p: str) -> str:
@@ -141,8 +139,9 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg.setdefault("generation_model", "qwen2.5:14b")
     cfg.setdefault("ollama_url", "http://localhost:11434")
     cfg.setdefault("state_dir", os.path.join("~", ".local", "share", "glean"))
-    cfg.setdefault("max_context_tokens", 6000)
+    cfg.setdefault("max_context_chars", 24000)  # ~6000 tokens at ~4 chars/token
     cfg.setdefault("top_k", 12)
+    cfg.setdefault("min_score", None)  # None = no filtering
 
     # Normalize paths in collections
     for name, coll in cfg["collections"].items():
@@ -158,12 +157,21 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
 # -----------------------------
 
 
+def _is_secret_file(fname: str) -> bool:
+    for pat in _SECRET_FILENAME_PATTERNS:
+        if fnmatch.fnmatch(fname, pat):
+            return True
+    return False
+
+
 def matches_any(path: str, patterns: Sequence[str]) -> bool:
+    """Return True if *path* (relative, using forward slashes) matches any pattern."""
     for pat in patterns:
         if pat.endswith("/"):
-            # directory-style exclusion: if any parent contains this segment
-            seg = pat.rstrip("/").split("/")[-1]
-            if f"/{seg}/" in path or path.endswith(f"/{seg}"):
+            # directory exclusion: match any path component, not just the last segment
+            dir_name = pat.rstrip("/")
+            parts = path.replace("\\", "/").split("/")
+            if dir_name in parts[:-1]:  # any directory component, not the filename
                 return True
         if fnmatch.fnmatch(os.path.basename(path), pat) or fnmatch.fnmatch(path, pat):
             return True
@@ -185,12 +193,12 @@ def discover_files(
         if not root_path.exists():
             continue
         for dirpath, dirnames, filenames in os.walk(root_path):
-            # Prune excluded directories
+            # Prune excluded directories in-place
             pruned = []
             for d in list(dirnames):
                 full = os.path.join(dirpath, d)
                 rel = os.path.relpath(full, root_path)
-                if matches_any(rel, exclude):
+                if matches_any(rel + "/", exclude):
                     continue
                 pruned.append(d)
             dirnames[:] = pruned
@@ -199,14 +207,12 @@ def discover_files(
                 abs_path = os.path.join(dirpath, fname)
                 rel = os.path.relpath(abs_path, root_path)
                 if os.path.getsize(abs_path) > 500 * 1024:
-                    # skip large files
+                    continue
+                if _is_secret_file(fname):
                     continue
                 if matches_any(rel, exclude):
                     continue
                 if not any(fnmatch.fnmatch(fname, pat) for pat in include):
-                    continue
-                # Avoid .env and similar secrets
-                if fname == ".env" or fname.endswith(".env"):
                     continue
                 results.append((abs_path, os.path.join(Path(root).name, rel)))
     return results
@@ -248,13 +254,14 @@ def detect_language(path: str) -> str:
     return "text"
 
 
-def _merge_small_chunks(
-    chunks: List[Tuple[str, int, int, Optional[str]]],
-    min_chars: int,
-) -> List[Tuple[str, int, int, Optional[str]]]:
+# Chunk tuple type: (text, start_line, end_line, heading)
+Chunk = Tuple[str, int, int, Optional[str]]
+
+
+def _merge_small_chunks(chunks: List[Chunk], min_chars: int) -> List[Chunk]:
     if not chunks:
         return []
-    merged: List[Tuple[str, int, int, Optional[str]]] = []
+    merged: List[Chunk] = []
     cur_text, cur_start, cur_end, cur_head = chunks[0]
     for text, start, end, head in chunks[1:]:
         if len(cur_text) < min_chars:
@@ -268,10 +275,10 @@ def _merge_small_chunks(
     return merged
 
 
-def _split_long(text: str, start_line: int, max_chars: int) -> List[Tuple[str, int, int]]:
-    """Fallback: split long text on double newlines approx max_chars."""
+def _split_long(text: str, start_line: int, max_chars: int) -> List[Chunk]:
+    """Fallback: split long text on double newlines up to max_chars, preserving heading=None."""
     paragraphs = text.split("\n\n")
-    chunks: List[Tuple[str, int, int]] = []
+    chunks: List[Chunk] = []
     cur_lines: List[str] = []
     cur_len = 0
     cur_start = start_line
@@ -281,7 +288,7 @@ def _split_long(text: str, start_line: int, max_chars: int) -> List[Tuple[str, i
         if cur_len + len(add) > max_chars and cur_lines:
             chunk_text = "\n".join(cur_lines).rstrip()
             end_line = line_no - 1
-            chunks.append((chunk_text, cur_start, end_line))
+            chunks.append((chunk_text, cur_start, end_line, None))
             cur_lines = [para]
             cur_len = len(para)
             cur_start = line_no
@@ -292,17 +299,16 @@ def _split_long(text: str, start_line: int, max_chars: int) -> List[Tuple[str, i
     if cur_lines:
         chunk_text = "\n".join(cur_lines).rstrip()
         end_line = line_no - 1
-        chunks.append((chunk_text, cur_start, end_line))
+        chunks.append((chunk_text, cur_start, end_line, None))
     return chunks
 
 
-def chunk_markdown(text: str, base_heading: Optional[str] = None) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_markdown(text: str, base_heading: Optional[str] = None) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current_heading = base_heading
     current_lines: List[str] = []
     start_line = 1
-    heading_line = 1
 
     def flush(end_line: int, heading: Optional[str]) -> None:
         if not current_lines:
@@ -311,77 +317,85 @@ def chunk_markdown(text: str, base_heading: Optional[str] = None) -> List[Tuple[
         chunks.append((section_text, start_line, end_line, heading))
 
     for idx, line in enumerate(lines, start=1):
-        if line.startswith("## "):  # H2
+        # Split on H1 and H2
+        if line.startswith("# ") or line.startswith("## "):
             flush(idx - 1, current_heading)
             current_heading = line.strip()
             current_lines = [line]
             start_line = idx
-            heading_line = idx
         else:
             if not current_lines:
                 start_line = idx
-                heading_line = idx
             current_lines.append(line)
     flush(len(lines), current_heading)
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 1500:
             processed.append((text_chunk, s, e, heading))
         else:
             # Split on H3 within this section
             sublines = text_chunk.splitlines()
-            sub_chunks: List[Tuple[str, int, int]] = []
+            sub_chunks: List[Chunk] = []
             cur: List[str] = []
             sub_start = s
             for off, line in enumerate(sublines):
                 abs_line = s + off
                 if line.startswith("### ") and cur:
-                    sub_chunks.append(("\n".join(cur).rstrip(), sub_start, abs_line - 1))
+                    sub_chunks.append(("\n".join(cur).rstrip(), sub_start, abs_line - 1, heading))
                     cur = [line]
                     sub_start = abs_line
                 else:
                     cur.append(line)
             if cur:
-                sub_chunks.append(("\n".join(cur).rstrip(), sub_start, s + len(sublines) - 1))
+                sub_chunks.append(("\n".join(cur).rstrip(), sub_start, s + len(sublines) - 1, heading))
 
-            for sub_text, sub_s, sub_e in sub_chunks:
+            for sub_text, sub_s, sub_e, sub_h in sub_chunks:
                 if len(sub_text) <= 1500:
-                    processed.append((sub_text, sub_s, sub_e, heading))
+                    processed.append((sub_text, sub_s, sub_e, sub_h))
                 else:
-                    for t, ss, ee in _split_long(sub_text, sub_s, 1500):
-                        processed.append((t, ss, ee, heading))
+                    processed.extend(_split_long(sub_text, sub_s, 1500))
 
     return _merge_small_chunks(processed, min_chars=100)
 
 
-PY_DEF_RE = re.compile(r"^(def|class)\s+\w+", re.MULTILINE)
+def _extract_file_docstring(lines: List[str]) -> Optional[str]:
+    """Extract a module-level docstring from Python source lines."""
+    # Skip shebang and blank lines
+    start = 0
+    while start < len(lines) and (lines[start].startswith("#") or not lines[start].strip()):
+        start += 1
+    if start >= len(lines):
+        return None
+    first = lines[start]
+    for delim in ('"""', "'''"):
+        if first.startswith(delim):
+            # Check single-line: """..."""
+            rest = first[len(delim):]
+            if rest.endswith(delim) and len(rest) > len(delim):
+                return first
+            # Multi-line
+            doc_lines = [first]
+            for i in range(start + 1, len(lines)):
+                doc_lines.append(lines[i])
+                if lines[i].strip().endswith(delim):
+                    return "\n".join(doc_lines)
+            break
+    return None
 
 
-def chunk_python(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_python(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
-    file_docstring: Optional[str] = None
-
-    # detect file-level docstring (very simple heuristic)
-    if lines and lines[0].startswith(('"""', "'''")):
-        doc_lines = [lines[0]]
-        for i in range(1, len(lines)):
-            doc_lines.append(lines[i])
-            if lines[i].startswith(('"""', "'''")) and i != 0:
-                file_docstring = "\n".join(doc_lines)
-                break
+    file_docstring = _extract_file_docstring(lines)
 
     def flush(end_line: int) -> None:
         if not current:
             return
         body = "\n".join(current).rstrip()
-        if file_docstring:
-            text_chunk = file_docstring + "\n\n" + body
-        else:
-            text_chunk = body
+        text_chunk = (file_docstring + "\n\n" + body) if file_docstring else body
         chunks.append((text_chunk, start_line, end_line, None))
 
     for idx, line in enumerate(lines, start=1):
@@ -395,20 +409,18 @@ def chunk_python(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    # Split very long chunks by method if class
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 3000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 3000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 3000))
     return _merge_small_chunks(processed, min_chars=50)
 
 
-def chunk_php(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_php(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
 
@@ -428,19 +440,18 @@ def chunk_php(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 3000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 3000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 3000))
     return _merge_small_chunks(processed, min_chars=50)
 
 
-def chunk_ts_js(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_ts_js(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
 
@@ -463,19 +474,18 @@ def chunk_ts_js(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 3000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 3000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 3000))
     return _merge_small_chunks(processed, min_chars=50)
 
 
-def chunk_yaml(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_yaml(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
     current_key: Optional[str] = None
@@ -483,8 +493,7 @@ def chunk_yaml(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
     def flush(end_line: int) -> None:
         if not current:
             return
-        heading = current_key
-        chunks.append(("\n".join(current).rstrip(), start_line, end_line, heading))
+        chunks.append(("\n".join(current).rstrip(), start_line, end_line, current_key))
 
     top_key_re = re.compile(r"^[a-zA-Z0-9_\-]+:")
     for idx, line in enumerate(lines, start=1):
@@ -500,24 +509,22 @@ def chunk_yaml(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 2000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 2000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 2000))
     return _merge_small_chunks(processed, min_chars=50)
 
 
-def chunk_json(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_json(text: str) -> List[Chunk]:
     try:
         data = json.loads(text)
     except Exception:
-        # fallback to generic
-        return _merge_small_chunks(_split_long(text, 1, 2000), min_chars=50)  # type: ignore[arg-type]
+        return _merge_small_chunks(_split_long(text, 1, 2000), min_chars=50)
 
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     if isinstance(data, dict):
         for key, value in data.items():
             pretty = json.dumps({key: value}, indent=2)
@@ -530,9 +537,9 @@ def chunk_json(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
     return _merge_small_chunks(chunks, min_chars=50)
 
 
-def chunk_shell(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_shell(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
     current_head: Optional[str] = None
@@ -558,19 +565,18 @@ def chunk_shell(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 2000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 2000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 2000))
     return _merge_small_chunks(processed, min_chars=50)
 
 
-def chunk_config(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_config(text: str) -> List[Chunk]:
     lines = text.splitlines()
-    chunks: List[Tuple[str, int, int, Optional[str]]] = []
+    chunks: List[Chunk] = []
     current: List[str] = []
     start_line = 1
     current_head: Optional[str] = None
@@ -596,22 +602,20 @@ def chunk_config(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
             current.append(line)
     flush(len(lines))
 
-    processed: List[Tuple[str, int, int, Optional[str]]] = []
+    processed: List[Chunk] = []
     for text_chunk, s, e, heading in chunks:
         if len(text_chunk) <= 1000:
             processed.append((text_chunk, s, e, heading))
         else:
-            for t, ss, ee in _split_long(text_chunk, s, 1000):
-                processed.append((t, ss, ee, heading))
+            processed.extend(_split_long(text_chunk, s, 1000))
     return _merge_small_chunks(processed, min_chars=30)
 
 
-def chunk_generic(text: str) -> List[Tuple[str, int, int, Optional[str]]]:
-    chunks = _split_long(text, 1, 1000)
-    return _merge_small_chunks(chunks, min_chars=50)  # type: ignore[arg-type]
+def chunk_generic(text: str) -> List[Chunk]:
+    return _merge_small_chunks(_split_long(text, 1, 1000), min_chars=50)
 
 
-def chunk_file_contents(path: str, text: str) -> List[Tuple[str, int, int, Optional[str]]]:
+def chunk_file_contents(path: str, text: str) -> List[Chunk]:
     lang = detect_language(path)
     if lang == "markdown":
         return chunk_markdown(text)
@@ -637,29 +641,28 @@ def chunk_file_contents(path: str, text: str) -> List[Tuple[str, int, int, Optio
 # -----------------------------
 
 
-def get_ollama_client(ollama_url: str) -> None:
-    # `ollama` library uses OLLAMA_HOST env var
+def _set_ollama_host(ollama_url: str) -> None:
     os.environ.setdefault("OLLAMA_HOST", ollama_url)
 
 
 def embed_texts(model: str, texts: Sequence[str], batch_size: int = 32) -> List[List[float]]:
     embeddings: List[List[float]] = []
     for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
+        batch = list(texts[i : i + batch_size])
         resp = ollama.embed(model=model, input=batch)
-        batch_emb = resp.get("embeddings") or resp.get("embedding")  # type: ignore[assignment]
-        if batch_emb is None:
+        # Support both typed response objects and plain dicts
+        if hasattr(resp, "embeddings"):
+            batch_emb = resp.embeddings
+        else:
+            batch_emb = resp.get("embeddings") or resp.get("embedding")
+        if not batch_emb:
             raise RuntimeError("Ollama embed response missing 'embeddings'")
         embeddings.extend(batch_emb)
     return embeddings
 
 
 def embed_single(model: str, text: str) -> List[float]:
-    resp = ollama.embed(model=model, input=[text])
-    emb = resp.get("embeddings") or resp.get("embedding")
-    if not emb:
-        raise RuntimeError("Ollama embed response missing 'embeddings'")
-    return emb[0]
+    return embed_texts(model, [text])[0]
 
 
 # -----------------------------
@@ -667,19 +670,13 @@ def embed_single(model: str, text: str) -> List[float]:
 # -----------------------------
 
 
-def get_chroma_client(state_dir: str):
+def get_chroma_client(state_dir: str) -> chromadb.ClientAPI:
     chroma_path = os.path.join(state_dir, "chroma")
     Path(chroma_path).mkdir(parents=True, exist_ok=True)
-    client = chromadb.Client(
-        Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=chroma_path,
-        )
-    )
-    return client
+    return chromadb.PersistentClient(path=chroma_path)
 
 
-def get_collection(client, name: str):
+def get_collection(client: chromadb.ClientAPI, name: str) -> chromadb.Collection:
     return client.get_or_create_collection(name=name)
 
 
@@ -693,16 +690,15 @@ def deterministic_chunk_id(collection: str, rel_path: str, idx: int) -> str:
 
 
 def index_collection(
-    client,
+    client: chromadb.ClientAPI,
     cfg: Dict[str, Any],
     index_state: IndexState,
     collection_name: str,
     reindex: bool = False,
 ) -> None:
-    coll_cfg = cfg["collections"][collection_name]
     embedding_model = cfg["embedding_model"]
     state_dir = expand_path(cfg["state_dir"])
-    get_ollama_client(cfg["ollama_url"])
+    _set_ollama_host(cfg["ollama_url"])
     chroma_coll = get_collection(client, collection_name)
 
     files = discover_files(collection_name, cfg)
@@ -712,11 +708,10 @@ def index_collection(
 
     to_add: List[Tuple[str, str]] = []
     to_update: List[Tuple[str, str]] = []
-    to_delete: List[str] = []
+    deleted_chunk_ids: List[str] = []
 
-    # Determine changes
     existing_paths = set(index_state.files.keys())
-    current_paths = set()
+    current_paths: set[str] = set()
 
     for abs_path, rel_path in files:
         current_paths.add(abs_path)
@@ -730,24 +725,37 @@ def index_collection(
     # Deleted files
     for abs_path in list(existing_paths):
         if abs_path not in current_paths:
-            entry = index_state.files.get(abs_path)
+            entry = index_state.files.pop(abs_path, None)
             if entry:
-                to_delete.extend(entry.chunk_ids)
-                del index_state.files[abs_path]
+                deleted_chunk_ids.extend(entry.chunk_ids)
 
-    if to_delete:
-        chroma_coll.delete(ids=to_delete)
+    if deleted_chunk_ids:
+        chroma_coll.delete(ids=deleted_chunk_ids)
 
-    def process_file(abs_path: str, rel_path: str) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[ChunkMetadata]]:
-        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+    # Delete old chunks for updated files and count them
+    updated_old_chunk_ids: List[str] = []
+    for abs_path, _ in to_update:
+        entry = index_state.files.get(abs_path)
+        if entry and entry.chunk_ids:
+            updated_old_chunk_ids.extend(entry.chunk_ids)
+    if updated_old_chunk_ids:
+        chroma_coll.delete(ids=updated_old_chunk_ids)
+
+    to_add_set = {abs_path for abs_path, _ in to_add}
+    total_new = 0
+    total_updated = 0
+
+    for abs_path, rel_path in to_add + to_update:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
         chunks = chunk_file_contents(abs_path, text)
+        if not chunks:
+            continue
         mtime = os.path.getmtime(abs_path)
         lang = detect_language(abs_path)
         ids: List[str] = []
         docs: List[str] = []
         metas: List[Dict[str, Any]] = []
-        meta_objs: List[ChunkMetadata] = []
         for idx, (chunk_text, start_line, end_line, heading) in enumerate(chunks):
             cid = deterministic_chunk_id(collection_name, rel_path, idx)
             ids.append(cid)
@@ -764,37 +772,20 @@ def index_collection(
                 char_count=len(chunk_text),
             )
             metas.append(meta.to_dict())
-            meta_objs.append(meta)
-        return ids, docs, metas, meta_objs
 
-    # Delete old chunks for updated files
-    for abs_path, _ in to_update:
-        entry = index_state.files.get(abs_path)
-        if entry and entry.chunk_ids:
-            chroma_coll.delete(ids=entry.chunk_ids)
-
-    total_new = 0
-    total_updated = 0
-
-    # Process additions and updates
-    for abs_path, rel_path in to_add + to_update:
-        ids, docs, metas, _ = process_file(abs_path, rel_path)
-        if not ids:
-            continue
         embeddings = embed_texts(embedding_model, docs)
         chroma_coll.upsert(ids=ids, documents=docs, embeddings=embeddings, metadatas=metas)
-        index_state.files[abs_path] = FileIndexEntry(
-            mtime=os.path.getmtime(abs_path),
-            chunk_ids=ids,
-        )
-        if (abs_path, rel_path) in to_add:
+        index_state.files[abs_path] = FileIndexEntry(mtime=mtime, chunk_ids=ids)
+
+        if abs_path in to_add_set:
             total_new += len(ids)
         else:
             total_updated += len(ids)
 
     console.print(
         f"[green]Indexed collection[/green] {collection_name} "
-        f"(new chunks: {total_new}, updated chunks: {total_updated}, deleted chunks: {len(to_delete)})"
+        f"(new chunks: {total_new}, updated chunks: {total_updated}, "
+        f"deleted chunks: {len(deleted_chunk_ids) + len(updated_old_chunk_ids)})"
     )
 
 
@@ -810,16 +801,18 @@ def index_all(
 
     collections = [collection_filter] if collection_filter else list(cfg["collections"].keys())
 
-    try:
-        for name in collections:
-            if name not in cfg["collections"]:
-                console.print(f"[red]Unknown collection:[/red] {name}")
-                return 3
+    for name in collections:
+        if name not in cfg["collections"]:
+            console.print(f"[red]Unknown collection:[/red] {name}")
+            return 3
+        try:
             index_collection(client, cfg, index_state, name, reindex=reindex)
-        index_state.save(index_meta_path)
-    except Exception as exc:
-        console.print(f"[red]Indexing failed:[/red] {exc}")
-        return 2
+        except Exception as exc:
+            console.print(f"[red]Indexing failed for '{name}':[/red] {exc}")
+            index_state.save(index_meta_path)
+            return 2
+
+    index_state.save(index_meta_path)
     return 0
 
 
@@ -833,13 +826,28 @@ Answer based ONLY on the provided context. If the context does not contain enoug
 Always cite the source file and line numbers for each claim you make."""
 
 
+def _truncate_context(parts: List[str], max_chars: int) -> List[str]:
+    """Return the largest prefix of parts whose joined length fits within max_chars."""
+    kept: List[str] = []
+    total = 0
+    sep = "\n\n---\n\n"
+    sep_len = len(sep)
+    for part in parts:
+        needed = len(part) + (sep_len if kept else 0)
+        if total + needed > max_chars:
+            break
+        kept.append(part)
+        total += needed
+    return kept
+
+
 def build_context_snippets(
     results: Dict[str, Any],
+    max_chars: int,
     verbose: bool,
 ) -> Tuple[str, List[ChunkMetadata], List[str]]:
     metadatas: List[ChunkMetadata] = []
     chunk_texts: List[str] = []
-    # results from Chroma: ids, documents, metadatas
     docs_list: List[str] = results.get("documents", [[]])[0]
     metas_list: List[Dict[str, Any]] = results.get("metadatas", [[]])[0]
     ids_list: List[str] = results.get("ids", [[]])[0]
@@ -860,8 +868,12 @@ def build_context_snippets(
         metadatas.append(cm)
         chunk_texts.append(doc)
         header = f"[File: {cm.file_name} ({cm.collection}), lines {cm.start_line}-{cm.end_line}]"
-        snippet = f"{header}\n{doc}"
-        parts.append(snippet)
+        parts.append(f"{header}\n{doc}")
+
+    parts = _truncate_context(parts, max_chars)
+    # Trim metadatas and chunk_texts to match kept parts
+    metadatas = metadatas[: len(parts)]
+    chunk_texts = chunk_texts[: len(parts)]
 
     context = "\n\n---\n\n".join(parts)
     if verbose:
@@ -878,18 +890,20 @@ def ask_question(
     collection_filter: Optional[str],
     generation_model_override: Optional[str],
     verbose: bool,
+    client: Optional[chromadb.ClientAPI] = None,
 ) -> int:
     state_dir = expand_path(cfg["state_dir"])
-    get_ollama_client(cfg["ollama_url"])
-    client = get_chroma_client(state_dir)
+    _set_ollama_host(cfg["ollama_url"])
+    if client is None:
+        client = get_chroma_client(state_dir)
     top_k = int(cfg.get("top_k", 12))
+    max_chars = int(cfg.get("max_context_chars", 24000))
 
     if collection_filter and collection_filter not in cfg["collections"]:
         console.print(f"[red]Unknown collection:[/red] {collection_filter}")
         return 3
 
     collections = [collection_filter] if collection_filter else list(cfg["collections"].keys())
-    # For now, query each collection individually and merge results.
     all_docs: List[str] = []
     all_metas: List[Dict[str, Any]] = []
     all_ids: List[str] = []
@@ -906,24 +920,20 @@ def ask_question(
             res = chroma_coll.query(query_embeddings=[q_embedding], n_results=top_k)
         except Exception:
             continue
-        docs = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        ids = res.get("ids", [[]])[0]
-        all_docs.extend(docs)
-        all_metas.extend(metas)
-        all_ids.extend(ids)
+        all_docs.extend(res.get("documents", [[]])[0])
+        all_metas.extend(res.get("metadatas", [[]])[0])
+        all_ids.extend(res.get("ids", [[]])[0])
 
     if not all_docs:
         console.print("[yellow]No relevant documents found in the index.[/yellow]")
         return 1
 
-    # Wrap combined results to match build_context_snippets input shape
     combined_results = {
         "documents": [all_docs],
         "metadatas": [all_metas],
         "ids": [all_ids],
     }
-    context, metadatas, _ = build_context_snippets(combined_results, verbose=verbose)
+    context, metadatas, _ = build_context_snippets(combined_results, max_chars=max_chars, verbose=verbose)
 
     user_prompt = f"Context:\n---\n{context}\n\nQuestion: {question}"
     model = generation_model_override or cfg["generation_model"]
@@ -941,21 +951,24 @@ def ask_question(
         console.print(f"[red]Generation failed:[/red] {exc}")
         return 1
 
-    content = resp["message"]["content"] if "message" in resp else str(resp)
+    # Support both typed response objects and plain dicts
+    if hasattr(resp, "message"):
+        content = resp.message.content
+    else:
+        content = resp["message"]["content"] if "message" in resp else str(resp)
 
     console.rule("[bold]Answer[/bold]")
     console.print(Markdown(content.strip()))
     console.print()
     console.print("[bold]Sources:[/bold]")
-    seen = set()
+    seen: set[Tuple[str, int, int]] = set()
     for meta in metadatas:
         key = (meta.file_name, meta.start_line, meta.end_line)
         if key in seen:
             continue
         seen.add(key)
-        rel_path = meta.file_path
         console.print(
-            f"  {rel_path}:{meta.start_line}-{meta.end_line} "
+            f"  {meta.file_path}:{meta.start_line}-{meta.end_line} "
             f"({meta.collection}, {meta.language})"
         )
     return 0
@@ -966,11 +979,12 @@ def ask_question(
 # -----------------------------
 
 
-def status_command(cfg: Dict[str, Any]) -> int:
+def status_command(cfg: Dict[str, Any], client: Optional[chromadb.ClientAPI] = None) -> int:
     state_dir = expand_path(cfg["state_dir"])
     index_meta_path = Path(state_dir) / "index_meta.json"
     index_state = IndexState.load(index_meta_path)
-    client = get_chroma_client(state_dir)
+    if client is None:
+        client = get_chroma_client(state_dir)
 
     table = Table(
         title="glean index status",
@@ -986,13 +1000,10 @@ def status_command(cfg: Dict[str, Any]) -> int:
     total_chunks = 0
 
     for name in cfg["collections"].keys():
-        chroma_coll = get_collection(client, name)
-        # Chroma does not expose per-collection stats directly; approximate via index_state
-        files_in_coll = []
+        files_in_coll: List[str] = []
         chunks_in_coll = 0
         last_mtime = 0.0
         for fp, entry in index_state.files.items():
-            # very rough heuristic: path under any of the collection roots
             for root in cfg["collections"][name]["paths"]:
                 if fp.startswith(root):
                     files_in_coll.append(fp)
@@ -1015,13 +1026,12 @@ def status_command(cfg: Dict[str, Any]) -> int:
     size_str = "-"
     try:
         if os.path.isdir(state_dir):
-            total_bytes = 0
-            for dirpath, _, filenames in os.walk(state_dir):
-                for fn in filenames:
-                    fp = os.path.join(dirpath, fn)
-                    total_bytes += os.path.getsize(fp)
-            size_mb = total_bytes / (1024 * 1024)
-            size_str = f"{size_mb:.1f} MB"
+            total_bytes = sum(
+                os.path.getsize(os.path.join(dirpath, fn))
+                for dirpath, _, filenames in os.walk(state_dir)
+                for fn in filenames
+            )
+            size_str = f"{total_bytes / (1024 * 1024):.1f} MB"
     except Exception:
         pass
 
@@ -1040,6 +1050,10 @@ def status_command(cfg: Dict[str, Any]) -> int:
 
 
 def interactive_mode(cfg: Dict[str, Any], collection: Optional[str], model: Optional[str], verbose: bool) -> int:
+    state_dir = expand_path(cfg["state_dir"])
+    # Reuse a single ChromaDB client for the session
+    client = get_chroma_client(state_dir)
+
     current_collection = collection or "all"
     current_model = model or cfg["generation_model"]
     verbose_flag = verbose
@@ -1082,7 +1096,7 @@ def interactive_mode(cfg: Dict[str, Any], collection: Optional[str], model: Opti
                 console.print("glean interactive mode (Ctrl+D to exit)")
                 console.print(f"Collection: {current_collection} | Model: {current_model}")
             elif cmd == "status":
-                status_command(cfg)
+                status_command(cfg, client=client)
             elif cmd in {"quit", "q"}:
                 break
             else:
@@ -1096,6 +1110,7 @@ def interactive_mode(cfg: Dict[str, Any], collection: Optional[str], model: Opti
             collection_filter=coll_filter,
             generation_model_override=current_model,
             verbose=verbose_flag,
+            client=client,
         )
         if rc != 0:
             console.print(f"[red]Query failed with code {rc}[/red]")
@@ -1188,4 +1203,3 @@ def main(argv: Sequence[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
-
