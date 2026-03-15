@@ -1,0 +1,18 @@
+embedding_model: nomic-embed-text
+generation_model: qwen2.5-coder:7b
+ollama_url: http://localhost:11434
+state_dir: ~/.local/share/glean
+max_context_chars: 24000
+top_k: 8
+
+collections:
+  glean:
+    paths:
+      - .
+    include:
+      - "*.py"
+      - "*.md"
+      - "*.yaml"
+      - "*.yml"
+    exclude:
+      - ".git/"
