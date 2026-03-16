@@ -970,12 +970,18 @@ def index_collection(
     to_update: List[Tuple[str, str]] = []
     deleted_chunk_ids: List[str] = []
 
-    # Scope existing_paths to only files under this collection's roots,
-    # so we don't clobber other collections' state when detecting deletions.
+    # Scope existing_paths to only files that were indexed by THIS collection
+    # (chunk IDs are prefixed with collection_name:).  Using both path-prefix
+    # AND chunk-id-prefix prevents a _docs sibling collection (sharing the same
+    # root paths but a disjoint include pattern) from treating the main
+    # collection's files as deleted and wiping them from index_state/corpus.
     coll_roots = tuple(expand_path(p) for p in cfg["collections"][collection_name]["paths"])
+    coll_prefix = collection_name + ":"
     existing_paths = {
-        fp for fp in index_state.files
-        if fp.startswith(coll_roots)
+        fp for fp, entry in index_state.files.items()
+        if fp.startswith(coll_roots) and any(
+            cid.startswith(coll_prefix) for cid in entry.chunk_ids
+        )
     }
     current_paths: set[str] = set()
 
