@@ -969,15 +969,16 @@ def ask_question(
             res = chroma_coll.query(
                 query_embeddings=[q_embedding],
                 n_results=top_k,
-                include=["documents", "metadatas", "ids", "distances"],
+                include=["documents", "metadatas", "distances"],
             )
-        except Exception:
+        except Exception as exc:
+            console.print(f"[dim]Collection {name} query error: {exc}[/dim]")
             continue
         docs = res.get("documents", [[]])[0]
         metas = res.get("metadatas", [[]])[0]
-        ids = res.get("ids", [[]])[0]
+        raw_ids = res.get("ids", [[]])[0]
         dists = res.get("distances", [[]])[0]
-        for doc, meta, cid, dist in zip(docs, metas, ids, dists):
+        for doc, meta, cid, dist in zip(docs, metas, raw_ids, dists):
             if max_distance is None or dist <= max_distance:
                 all_docs.append(doc)
                 all_metas.append(meta)

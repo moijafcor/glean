@@ -115,7 +115,7 @@ async def ask(request: Request):
                     res = coll.query(
                         query_embeddings=[q_embedding],
                         n_results=top_k,
-                        include=["documents", "metadatas", "ids", "distances"],
+                        include=["documents", "metadatas", "distances"],
                     )
                 except Exception:
                     continue
