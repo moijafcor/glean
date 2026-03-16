@@ -9,3 +9,4 @@ chromadb
 ollama
 pyyaml
 rich
+rank-bm25

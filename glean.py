@@ -28,6 +28,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import chromadb
 import ollama
 import yaml
+
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    _BM25_AVAILABLE = False
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
@@ -100,6 +106,161 @@ class IndexState:
 
 
 # -----------------------------
+# BM25 Corpus & RRF
+# -----------------------------
+
+
+@dataclass
+class BM25Corpus:
+    """Parallel keyword index stored as JSON alongside ChromaDB.
+
+    The corpus maps chunk_id → {text, collection} and is updated in sync
+    with every ChromaDB upsert/delete in index_collection.  At query time
+    a BM25Okapi instance is built lazily and cached for the process lifetime.
+    """
+
+    entries: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._bm25: Any = None
+        self._bm25_ids: List[str] = []
+
+    @classmethod
+    def load(cls, path: Path) -> "BM25Corpus":
+        if not path.exists():
+            return cls()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                entries = json.load(f)
+        except Exception:
+            return cls()
+        return cls(entries=entries)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.entries, f, separators=(",", ":"))
+
+    def add(self, chunk_id: str, text: str, collection: str) -> None:
+        self.entries[chunk_id] = {"text": text, "collection": collection}
+        self._bm25 = None  # invalidate cache
+
+    def remove_many(self, chunk_ids: Sequence[str]) -> None:
+        changed = any(cid in self.entries for cid in chunk_ids)
+        for cid in chunk_ids:
+            self.entries.pop(cid, None)
+        if changed:
+            self._bm25 = None
+
+    def query(
+        self,
+        query_tokens: List[str],
+        top_k: int,
+        collection_filter: Optional[str],
+    ) -> List[Tuple[str, float]]:
+        """Return [(chunk_id, bm25_score), ...] sorted descending, up to top_k."""
+        if not _BM25_AVAILABLE or not self.entries:
+            return []
+        if collection_filter:
+            ids = [cid for cid, v in self.entries.items()
+                   if v.get("collection") == collection_filter]
+        else:
+            ids = list(self.entries.keys())
+        if not ids:
+            return []
+        # Rebuild BM25 when the ID set changes (new index run) or cache is cold
+        if self._bm25 is None or self._bm25_ids != ids:
+            tokenized = [_tokenize(self.entries[cid]["text"]) for cid in ids]
+            self._bm25 = _BM25Okapi(tokenized)
+            self._bm25_ids = ids
+        scores = self._bm25.get_scores(query_tokens)
+        ranked = sorted(zip(ids, scores.tolist()), key=lambda x: x[1], reverse=True)
+        return ranked[:top_k]
+
+    def query_rare_terms(
+        self,
+        query_tokens: List[str],
+        top_k: int,
+        collection_filter: Optional[str],
+    ) -> List[Tuple[str, float]]:
+        """Run BM25 using only the rarest query tokens (highest IDF).
+
+        Prevents common words like 'public', 'address', 'function' from drowning
+        out specific identifiers like 'rafael' in the ranking.  Selects up to 3
+        tokens whose document-frequency is below 1% of the corpus.
+        """
+        if not _BM25_AVAILABLE or not self.entries:
+            return []
+        if not query_tokens:
+            return []
+        # Compute per-token document frequency
+        n = len(self.entries)
+        df: Dict[str, int] = {}
+        for tok in set(query_tokens):
+            df[tok] = sum(1 for e in self.entries.values() if tok in e["text"].lower())
+        # Select rare tokens: df < 1% of corpus and > 0
+        rare = [t for t in query_tokens if 0 < df.get(t, n) < n * 0.01]
+        if not rare:
+            # Fall back to least-common tokens among the query set
+            rare = sorted(
+                [t for t in query_tokens if df.get(t, 0) > 0],
+                key=lambda t: df.get(t, n),
+            )[:2]
+        if not rare:
+            return []
+        # Combine rare token(s) with the rest of the query tokens so that
+        # documents matching both "rafael" AND "ip address" score higher than
+        # those matching only "rafael".  Rare tokens are repeated to give them
+        # extra weight in the BM25 scoring.
+        boosted = rare * 2 + [t for t in query_tokens if t not in rare]
+        return self.query(boosted, top_k, collection_filter)
+
+
+def _bm25_corpus_path(state_dir: str) -> Path:
+    return Path(state_dir) / "bm25_corpus.json"
+
+
+_WORD_RE = re.compile(r"\w+")
+
+# Common English stopwords that add noise without discriminating power
+_STOPWORDS = frozenset(
+    "a an and are as at be been being by do does from has have he her his how "
+    "i if in is it its me my no not of on or our s she so some that the their "
+    "them there they this to up us was we were what when where which who will "
+    "with you your".split()
+)
+
+
+def _tokenize(text: str) -> List[str]:
+    """Word-boundary tokenizer: splits on non-alphanumeric boundaries and
+    removes English stopwords.
+
+    "ip: 198.55.58.201" → ["ip", "198", "55", "58", "201"]
+    "rafael.pluio.net"  → ["rafael", "pluio", "net"]
+    "What is rafael public IP?" → ["rafael", "public", "ip"]
+    """
+    return [w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS]
+
+
+def rrf_merge(
+    dense_ids: List[str],
+    sparse_ids: List[str],
+    k: int = 60,
+) -> List[str]:
+    """Reciprocal Rank Fusion over two ordered ID lists.
+
+    Score = sum(1 / (k + rank)) across lists; higher is better.
+    Returns IDs sorted by score descending (deduped).
+    """
+    scores: Dict[str, float] = {}
+    for rank, cid in enumerate(dense_ids, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    for rank, cid in enumerate(sparse_ids, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=lambda c: scores[c], reverse=True)
+
+
+# -----------------------------
 # Config Loading
 # -----------------------------
 
@@ -140,7 +301,9 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg.setdefault("ollama_url", "http://localhost:11434")
     cfg.setdefault("state_dir", os.path.join("~", ".local", "share", "glean"))
     cfg.setdefault("max_context_chars", 24000)  # ~6000 tokens at ~4 chars/token
-    cfg.setdefault("top_k", 20)
+    cfg.setdefault("top_k", 30)
+    cfg.setdefault("bm25_top_k", 50)
+    cfg.setdefault("rrf_k", 60)
     cfg.setdefault("max_distance", None)  # None = no filtering; e.g. 0.65 to drop noise
 
     # Normalize paths in collections
@@ -726,6 +889,7 @@ def index_collection(
     client: chromadb.ClientAPI,
     cfg: Dict[str, Any],
     index_state: IndexState,
+    corpus: BM25Corpus,
     collection_name: str,
     reindex: bool = False,
 ) -> None:
@@ -773,6 +937,7 @@ def index_collection(
 
     if deleted_chunk_ids:
         chroma_coll.delete(ids=deleted_chunk_ids)
+        corpus.remove_many(deleted_chunk_ids)
 
     # Delete old chunks for updated files and count them
     updated_old_chunk_ids: List[str] = []
@@ -782,6 +947,7 @@ def index_collection(
             updated_old_chunk_ids.extend(entry.chunk_ids)
     if updated_old_chunk_ids:
         chroma_coll.delete(ids=updated_old_chunk_ids)
+        corpus.remove_many(updated_old_chunk_ids)
 
     to_add_set = {abs_path for abs_path, _ in to_add}
     total_new = 0
@@ -821,6 +987,8 @@ def index_collection(
 
         embeddings = embed_texts(embedding_model, docs)
         chroma_coll.upsert(ids=ids, documents=docs, embeddings=embeddings, metadatas=metas)
+        for cid, doc_text in zip(ids, docs):
+            corpus.add(cid, doc_text, collection_name)
         index_state.files[abs_path] = FileIndexEntry(mtime=mtime, chunk_ids=ids)
 
         if abs_path in to_add_set:
@@ -835,6 +1003,47 @@ def index_collection(
     )
 
 
+def _bootstrap_corpus(
+    client: chromadb.ClientAPI,
+    cfg: Dict[str, Any],
+    corpus: BM25Corpus,
+    collection_filter: Optional[str],
+) -> None:
+    """Populate corpus from existing ChromaDB data without re-embedding.
+
+    Called automatically when the corpus is detected to be stale (significantly
+    fewer entries than chunks known to index_state).  Fetches documents in
+    batches of 1000 per collection.
+    """
+    collections = [collection_filter] if collection_filter else list(cfg["collections"].keys())
+    batch_size = 1000
+    total = 0
+    for name in collections:
+        coll = get_collection(client, name)
+        offset = 0
+        while True:
+            try:
+                res = coll.get(
+                    limit=batch_size,
+                    offset=offset,
+                    include=["documents", "metadatas"],
+                )
+            except Exception:
+                break
+            docs = res.get("documents") or []
+            metas = res.get("metadatas") or []
+            ids = res.get("ids") or []
+            if not ids:
+                break
+            for cid, doc, meta in zip(ids, docs, metas):
+                corpus.add(cid, doc, meta.get("collection", name) if meta else name)
+            total += len(ids)
+            if len(ids) < batch_size:
+                break
+            offset += batch_size
+    console.print(f"[dim]BM25 corpus bootstrapped from ChromaDB: {total} chunks[/dim]")
+
+
 def index_all(
     cfg: Dict[str, Any],
     collection_filter: Optional[str],
@@ -842,8 +1051,17 @@ def index_all(
 ) -> int:
     state_dir = expand_path(cfg["state_dir"])
     index_meta_path = Path(state_dir) / "index_meta.json"
+    corpus_path = _bm25_corpus_path(state_dir)
     index_state = IndexState.load(index_meta_path)
+    corpus = BM25Corpus.load(corpus_path)
     client = get_chroma_client(state_dir)
+
+    # Auto-bootstrap corpus if it's empty or far behind the known chunk count
+    total_known_chunks = sum(
+        len(e.chunk_ids) for e in index_state.files.values()
+    )
+    if _BM25_AVAILABLE and len(corpus.entries) < total_known_chunks * 0.5:
+        _bootstrap_corpus(client, cfg, corpus, collection_filter)
 
     collections = [collection_filter] if collection_filter else list(cfg["collections"].keys())
 
@@ -852,12 +1070,14 @@ def index_all(
             console.print(f"[red]Unknown collection:[/red] {name}")
             return 3
         try:
-            index_collection(client, cfg, index_state, name, reindex=reindex)
+            index_collection(client, cfg, index_state, corpus, name, reindex=reindex)
         except Exception as exc:
             console.print(f"[red]Indexing failed for '{name}':[/red] {exc}")
+            corpus.save(corpus_path)
             index_state.save(index_meta_path)
             return 2
 
+    corpus.save(corpus_path)
     index_state.save(index_meta_path)
     return 0
 
@@ -867,9 +1087,10 @@ def index_all(
 # -----------------------------
 
 
-SYSTEM_PROMPT = """You are a knowledgeable assistant that answers questions about a software development infrastructure and codebase.
-Answer based ONLY on the provided context. If the context does not contain enough information to answer, say you don't know and do not guess.
-Always cite the source file and line numbers for each claim you make."""
+SYSTEM_PROMPT = """You are a knowledgeable assistant that answers questions about software, infrastructure, and project documentation.
+Answer based ONLY on the provided context snippets. Read ALL context snippets carefully before answering — the answer may appear in any snippet.
+If the context contains the answer, state it directly and cite the source file and line numbers.
+If the context does not contain enough information to answer, say so and do not guess."""
 
 
 def _truncate_context(parts: List[str], max_chars: int) -> List[str]:
@@ -930,38 +1151,32 @@ def build_context_snippets(
     return context, metadatas, chunk_texts
 
 
-def ask_question(
+def retrieve_chunks(
     cfg: Dict[str, Any],
     question: str,
+    q_embedding: List[float],
     collection_filter: Optional[str],
-    generation_model_override: Optional[str],
-    verbose: bool,
-    client: Optional[chromadb.ClientAPI] = None,
-) -> int:
-    state_dir = expand_path(cfg["state_dir"])
-    _set_ollama_host(cfg["ollama_url"])
-    if client is None:
-        client = get_chroma_client(state_dir)
+    client: chromadb.ClientAPI,
+    corpus: BM25Corpus,
+) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
+    """Hybrid (dense + BM25 sparse) retrieval with RRF merge.
+
+    Returns (docs, metas, ids) ordered by relevance.  BM25-only hits that are
+    not in the dense result set are fetched from ChromaDB in a single batch
+    call per collection so their metadatas are available.
+    """
     top_k = int(cfg.get("top_k", 20))
-    max_chars = int(cfg.get("max_context_chars", 24000))
+    bm25_top_k = int(cfg.get("bm25_top_k", top_k))
+    rrf_k = int(cfg.get("rrf_k", 60))
     max_distance: Optional[float] = cfg.get("max_distance")
     if max_distance is not None:
         max_distance = float(max_distance)
 
-    if collection_filter and collection_filter not in cfg["collections"]:
-        console.print(f"[red]Unknown collection:[/red] {collection_filter}")
-        return 3
-
     collections = [collection_filter] if collection_filter else list(cfg["collections"].keys())
-    all_docs: List[str] = []
-    all_metas: List[Dict[str, Any]] = []
-    all_ids: List[str] = []
 
-    try:
-        q_embedding = embed_single(cfg["embedding_model"], question)
-    except Exception as exc:
-        console.print(f"[red]Embedding failed:[/red] {exc}")
-        return 1
+    # --- Dense retrieval ---
+    dense_ids_ranked: List[str] = []
+    dense_map: Dict[str, Tuple[str, Dict]] = {}  # chunk_id -> (doc, meta)
 
     for name in collections:
         chroma_coll = get_collection(client, name)
@@ -980,9 +1195,97 @@ def ask_question(
         dists = res.get("distances", [[]])[0]
         for doc, meta, cid, dist in zip(docs, metas, raw_ids, dists):
             if max_distance is None or dist <= max_distance:
-                all_docs.append(doc)
-                all_metas.append(meta)
-                all_ids.append(cid)
+                dense_ids_ranked.append(cid)
+                dense_map[cid] = (doc, meta)
+
+    # --- Sparse (BM25) retrieval ---
+    query_tokens = _tokenize(question)
+    sparse_results = corpus.query(query_tokens, bm25_top_k, collection_filter)
+    sparse_ids_ranked = [cid for cid, _ in sparse_results]
+
+    # --- Sparse rare-term pass (boosts exact-match on specific identifiers) ---
+    rare_results = corpus.query_rare_terms(query_tokens, bm25_top_k, collection_filter)
+    rare_ids_ranked = [cid for cid, _ in rare_results]
+
+    # --- RRF merge (dense + full BM25 + rare-term BM25) ---
+    if sparse_ids_ranked or rare_ids_ranked:
+        scores: Dict[str, float] = {}
+        for rank, cid in enumerate(dense_ids_ranked, start=1):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+        for rank, cid in enumerate(sparse_ids_ranked, start=1):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+        for rank, cid in enumerate(rare_ids_ranked, start=1):
+            # Rare-term list gets double weight — it's the most targeted signal
+            scores[cid] = scores.get(cid, 0.0) + 2.0 / (rrf_k + rank)
+        merged_ids = sorted(scores, key=lambda c: scores[c], reverse=True)
+    else:
+        merged_ids = dense_ids_ranked
+
+    # Fetch metadata for BM25-only hits (not in dense results) via batch get
+    bm25_only_ids = [cid for cid in merged_ids if cid not in dense_map]
+    if bm25_only_ids:
+        # Group by collection for efficient batch fetching
+        by_collection: Dict[str, List[str]] = {}
+        for cid in bm25_only_ids:
+            entry = corpus.entries.get(cid)
+            if entry:
+                cname = entry.get("collection", "")
+                by_collection.setdefault(cname, []).append(cid)
+        for cname, cids in by_collection.items():
+            chroma_coll = get_collection(client, cname)
+            try:
+                got = chroma_coll.get(ids=cids, include=["documents", "metadatas"])
+                for doc, meta, cid in zip(
+                    got.get("documents") or [],
+                    got.get("metadatas") or [],
+                    got.get("ids") or [],
+                ):
+                    dense_map[cid] = (doc, meta)
+            except Exception:
+                pass
+
+    # Reconstruct in merged order
+    all_docs: List[str] = []
+    all_metas: List[Dict[str, Any]] = []
+    all_ids: List[str] = []
+    for cid in merged_ids:
+        if cid in dense_map:
+            doc, meta = dense_map[cid]
+            all_docs.append(doc)
+            all_metas.append(meta)
+            all_ids.append(cid)
+
+    return all_docs, all_metas, all_ids
+
+
+def ask_question(
+    cfg: Dict[str, Any],
+    question: str,
+    collection_filter: Optional[str],
+    generation_model_override: Optional[str],
+    verbose: bool,
+    client: Optional[chromadb.ClientAPI] = None,
+) -> int:
+    state_dir = expand_path(cfg["state_dir"])
+    _set_ollama_host(cfg["ollama_url"])
+    if client is None:
+        client = get_chroma_client(state_dir)
+    max_chars = int(cfg.get("max_context_chars", 24000))
+
+    if collection_filter and collection_filter not in cfg["collections"]:
+        console.print(f"[red]Unknown collection:[/red] {collection_filter}")
+        return 3
+
+    try:
+        q_embedding = embed_single(cfg["embedding_model"], question)
+    except Exception as exc:
+        console.print(f"[red]Embedding failed:[/red] {exc}")
+        return 1
+
+    corpus = BM25Corpus.load(_bm25_corpus_path(state_dir))
+    all_docs, all_metas, all_ids = retrieve_chunks(
+        cfg, question, q_embedding, collection_filter, client, corpus
+    )
 
     if not all_docs:
         console.print("[yellow]No relevant documents found in the index.[/yellow]")
