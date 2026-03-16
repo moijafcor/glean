@@ -684,6 +684,67 @@ def chunk_yaml(text: str) -> List[Chunk]:
     return _merge_small_chunks(processed, min_chars=50)
 
 
+# Matches host-entry keys indented 8–16 spaces that look like FQDNs or
+# hostnames (contain at least one dot or are purely alphanumeric/hyphen).
+_ANSIBLE_HOST_RE = re.compile(
+    r"^( {8,16})([a-zA-Z0-9][a-zA-Z0-9_\-]*(?:\.[a-zA-Z0-9_\-]+)+)\s*:"
+)
+
+
+def _is_ansible_inventory(path: str) -> bool:
+    """Return True if path looks like an Ansible inventory/hosts YAML file."""
+    name = os.path.basename(path).lower()
+    parts = path.replace("\\", "/").split("/")
+    return (
+        name in ("hosts", "hosts.yml", "hosts.yaml")
+        or "inventory" in parts
+        or "inventories" in parts
+    )
+
+
+def chunk_yaml_inventory(text: str) -> List[Chunk]:
+    """Chunk Ansible inventory YAML at the host-entry level.
+
+    Top-level keys (groups) are split normally; within each top-level block
+    we further split at deeply-indented FQDN-like host keys so that each
+    host gets its own chunk rather than being buried in a 50-host blob.
+    """
+    lines = text.splitlines()
+    chunks: List[Chunk] = []
+    current: List[str] = []
+    start_line = 1
+    current_key: Optional[str] = None
+
+    def flush(end_line: int) -> None:
+        if current:
+            chunks.append(("\n".join(current).rstrip(), start_line, end_line, current_key))
+
+    top_key_re = re.compile(r"^[a-zA-Z0-9_\-]+:")
+
+    for idx, line in enumerate(lines, start=1):
+        is_top = top_key_re.match(line)
+        is_host = _ANSIBLE_HOST_RE.match(line)
+        if (is_top or is_host) and current:
+            flush(idx - 1)
+            current = [line]
+            start_line = idx
+            current_key = line.strip().rstrip(":")
+        else:
+            if not current:
+                start_line = idx
+                current_key = line.strip().rstrip(":") if (is_top or is_host) else None
+            current.append(line)
+    flush(len(lines))
+
+    processed: List[Chunk] = []
+    for text_chunk, s, e, heading in chunks:
+        if len(text_chunk) <= 2000:
+            processed.append((text_chunk, s, e, heading))
+        else:
+            processed.extend(_split_long(text_chunk, s, 2000))
+    return _merge_small_chunks(processed, min_chars=30)
+
+
 def chunk_json(text: str) -> List[Chunk]:
     try:
         data = json.loads(text)
@@ -792,6 +853,8 @@ def chunk_file_contents(path: str, text: str) -> List[Chunk]:
     if lang == "ts_js":
         return chunk_ts_js(text)
     if lang == "yaml":
+        if _is_ansible_inventory(path):
+            return chunk_yaml_inventory(text)
         return chunk_yaml(text)
     if lang == "json":
         return chunk_json(text)
@@ -988,7 +1051,8 @@ def index_collection(
         embeddings = embed_texts(embedding_model, docs)
         chroma_coll.upsert(ids=ids, documents=docs, embeddings=embeddings, metadatas=metas)
         for cid, doc_text in zip(ids, docs):
-            corpus.add(cid, doc_text, collection_name)
+            corpus_text = f"# {rel_path}\n{doc_text}"
+            corpus.add(cid, corpus_text, collection_name)
         index_state.files[abs_path] = FileIndexEntry(mtime=mtime, chunk_ids=ids)
 
         if abs_path in to_add_set:
@@ -1036,7 +1100,20 @@ def _bootstrap_corpus(
             if not ids:
                 break
             for cid, doc, meta in zip(ids, docs, metas):
-                corpus.add(cid, doc, meta.get("collection", name) if meta else name)
+                coll_name = meta.get("collection", name) if meta else name
+                file_path = meta.get("file_path", "") if meta else ""
+                if file_path:
+                    # Reconstruct rel_path from absolute path using collection roots
+                    rel = file_path
+                    for root_path in cfg["collections"].get(coll_name, {}).get("paths", []):
+                        expanded = expand_path(root_path)
+                        if file_path.startswith(expanded + "/"):
+                            rel = file_path[len(expanded) + 1:]
+                            break
+                    corpus_text = f"# {rel}\n{doc}"
+                else:
+                    corpus_text = doc
+                corpus.add(cid, corpus_text, coll_name)
             total += len(ids)
             if len(ids) < batch_size:
                 break

@@ -60,6 +60,29 @@ collections:
       - "package-lock.json"
       - "yarn.lock"
       - "composer.lock"
+      - "*plan*.md"
+      - "*mandate*.md"
+      - "*brief*.md"
+      - "*spec*.md"
+
+  starshot_docs:
+    paths:
+      - ~/starshot/arrow_acquisition
+      - ~/starshot/champion
+      - ~/starshot/formula_win
+      - ~/starshot/intelligenz
+      - ~/starshot/maverick
+      - ~/starshot/payloads
+      - ~/starshot/sop
+      - ~/starshot/spotlight
+      - ~/starshot/triple_blitz
+    include:
+      - "*plan*.md"
+      - "*mandate*.md"
+      - "*brief*.md"
+      - "*spec*.md"
+    exclude:
+      - ".git/"
 
   starshot_wp:
     paths:
@@ -124,3 +147,27 @@ collections:
       - "package-lock.json"
       - "yarn.lock"
       - "composer.lock"
+      - "*plan*.md"
+      - "*mandate*.md"
+      - "*brief*.md"
+      - "*spec*.md"
+
+  code_docs:
+    paths:
+      - ~/code/ansible-playbooks
+      - ~/code/app.fitter.live
+      - ~/code/app.jalalio.com
+      - ~/code/app.pollzapper.com
+      - ~/code/app.yotober.com
+      - ~/code/aprenter.com
+      - ~/code/diskpulse
+      - ~/code/moilab
+    include:
+      - "*plan*.md"
+      - "*mandate*.md"
+      - "*brief*.md"
+      - "*spec*.md"
+    exclude:
+      - ".git/"
+      - "node_modules/"
+      - "vendor/"
