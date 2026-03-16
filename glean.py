@@ -842,9 +842,59 @@ def chunk_generic(text: str) -> List[Chunk]:
     return _merge_small_chunks(_split_long(text, 1, 1000), min_chars=50)
 
 
+# Matches markdown host-list lines: "- IP  hostname  [optional FQDN ...]"
+_MD_HOST_LINE_RE = re.compile(
+    r"^-\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\S+)"
+)
+
+
+def _is_markdown_host_list(text: str) -> bool:
+    """Return True if the file looks like a flat host/IP inventory in markdown.
+
+    Requires at least 4 lines matching the '- IP  hostname' pattern so we
+    don't accidentally split normal bullet lists.
+    """
+    count = sum(1 for line in text.splitlines() if _MD_HOST_LINE_RE.match(line))
+    return count >= 4
+
+
+def chunk_markdown_host_list(text: str) -> List[Chunk]:
+    """Chunk a markdown host-list file so each host entry is its own chunk.
+
+    Each "- IP  hostname  [FQDN]" line becomes a standalone chunk (prepended
+    with any header lines from the top of the file).  This prevents the LLM
+    from confusing one host's IP with another when all entries are in one blob.
+    """
+    lines = text.splitlines()
+    chunks: List[Chunk] = []
+
+    # Collect preamble lines (headings etc.) before the first host entry
+    preamble: List[str] = []
+    preamble_done = False
+
+    for idx, line in enumerate(lines, start=1):
+        if _MD_HOST_LINE_RE.match(line):
+            preamble_done = True
+            # Each host is a self-contained chunk: preamble + this line
+            chunk_text = ("\n".join(preamble) + "\n" + line).strip() if preamble else line
+            chunks.append((chunk_text, idx, idx, line.strip()))
+        else:
+            if not preamble_done:
+                preamble.append(line)
+            # Non-host lines after the preamble (blank lines between entries) are skipped
+
+    if not chunks:
+        # No host lines found — fall back to standard markdown chunking
+        return chunk_markdown(text)
+
+    return chunks
+
+
 def chunk_file_contents(path: str, text: str) -> List[Chunk]:
     lang = detect_language(path)
     if lang == "markdown":
+        if _is_markdown_host_list(text):
+            return chunk_markdown_host_list(text)
         return chunk_markdown(text)
     if lang == "python":
         return chunk_python(text)
