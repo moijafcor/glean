@@ -3,7 +3,8 @@ generation_model: qwen2.5-coder:7b
 ollama_url: http://localhost:11434
 state_dir: ~/.local/share/glean
 max_context_chars: 24000
-top_k: 8
+top_k: 20
+max_distance: 0.65
 
 collections:
   glean:
@@ -57,6 +58,29 @@ collections:
       - "package-lock.json"
       - "yarn.lock"
       - "composer.lock"
+
+  starshot_wp:
+    paths:
+      - ~/starshot_codebases/formulawin
+      - ~/starshot_codebases/projectarrow2
+      - ~/starshot_codebases/tripleblitz
+    include:
+      - "*.php"
+      - "*.js"
+      - "*.ts"
+      - "*.md"
+      - "*.json"
+      - "*.yaml"
+      - "*.yml"
+      - "*.css"
+    exclude:
+      - ".git/"
+      - "node_modules/"
+      - "vendor/"
+      - "uploads/"
+      - "*.min.js"
+      - "*.min.css"
+      - "wp-core/"
 
   code:
     paths:

@@ -103,15 +103,31 @@ async def ask(request: Request):
         # 1. Embed + retrieve + build context (blocking — run in thread pool)
         def do_retrieve():
             q_embedding = glean_lib.embed_single(cfg["embedding_model"], question)
-            top_k = int(cfg.get("top_k", 8))
+            top_k = int(cfg.get("top_k", 20))
+            max_distance = cfg.get("max_distance")
+            if max_distance is not None:
+                max_distance = float(max_distance)
             all_docs, all_metas, all_ids = [], [], []
             collections = [collection] if collection else list(cfg["collections"].keys())
             for name in collections:
                 coll = glean_lib.get_collection(chroma_client, name)
-                res = coll.query(query_embeddings=[q_embedding], n_results=top_k)
-                all_docs.extend(res.get("documents", [[]])[0])
-                all_metas.extend(res.get("metadatas", [[]])[0])
-                all_ids.extend(res.get("ids", [[]])[0])
+                try:
+                    res = coll.query(
+                        query_embeddings=[q_embedding],
+                        n_results=top_k,
+                        include=["documents", "metadatas", "ids", "distances"],
+                    )
+                except Exception:
+                    continue
+                docs = res.get("documents", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+                ids = res.get("ids", [[]])[0]
+                dists = res.get("distances", [[]])[0]
+                for doc, meta, cid, dist in zip(docs, metas, ids, dists):
+                    if max_distance is None or dist <= max_distance:
+                        all_docs.append(doc)
+                        all_metas.append(meta)
+                        all_ids.append(cid)
             if not all_docs:
                 return None, None, None
             combined = {"documents": [all_docs], "metadatas": [all_metas], "ids": [all_ids]}

@@ -140,8 +140,8 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg.setdefault("ollama_url", "http://localhost:11434")
     cfg.setdefault("state_dir", os.path.join("~", ".local", "share", "glean"))
     cfg.setdefault("max_context_chars", 24000)  # ~6000 tokens at ~4 chars/token
-    cfg.setdefault("top_k", 12)
-    cfg.setdefault("min_score", None)  # None = no filtering
+    cfg.setdefault("top_k", 20)
+    cfg.setdefault("max_distance", None)  # None = no filtering; e.g. 0.65 to drop noise
 
     # Normalize paths in collections
     for name, coll in cfg["collections"].items():
@@ -655,9 +655,17 @@ _EMBED_MAX_CHARS = 3000
 
 
 def embed_texts(model: str, texts: Sequence[str], batch_size: int = 32) -> List[List[float]]:
+    """Embed a batch of document texts for indexing.
+
+    Applies the ``search_document:`` task prefix required by nomic-embed-text
+    for asymmetric retrieval (document side).  The prefix is stripped to within
+    the char budget so a long prefix never eats into actual content.
+    """
     embeddings: List[List[float]] = []
+    prefix = "search_document: "
+    budget = _EMBED_MAX_CHARS - len(prefix)
     for i in range(0, len(texts), batch_size):
-        batch = [t[:_EMBED_MAX_CHARS] for t in texts[i : i + batch_size]]
+        batch = [prefix + t[:budget] for t in texts[i : i + batch_size]]
         resp = ollama.embed(model=model, input=batch)
         # Support both typed response objects and plain dicts
         if hasattr(resp, "embeddings"):
@@ -671,7 +679,20 @@ def embed_texts(model: str, texts: Sequence[str], batch_size: int = 32) -> List[
 
 
 def embed_single(model: str, text: str) -> List[float]:
-    return embed_texts(model, [text])[0]
+    """Embed a single query string.
+
+    Applies the ``search_query:`` task prefix required by nomic-embed-text for
+    asymmetric retrieval (query side).
+    """
+    prefix = "search_query: "
+    budget = _EMBED_MAX_CHARS - len(prefix)
+    resp = ollama.embed(model=model, input=[prefix + text[:budget]])
+    if hasattr(resp, "embeddings"):
+        return resp.embeddings[0]
+    raw = resp.get("embeddings") or resp.get("embedding")
+    if not raw:
+        raise RuntimeError("Ollama embed response missing 'embeddings'")
+    return raw[0] if isinstance(raw[0], list) else raw
 
 
 # -----------------------------
@@ -686,7 +707,10 @@ def get_chroma_client(state_dir: str) -> chromadb.ClientAPI:
 
 
 def get_collection(client: chromadb.ClientAPI, name: str) -> chromadb.Collection:
-    return client.get_or_create_collection(name=name)
+    return client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"},
+    )
 
 
 # -----------------------------
@@ -918,8 +942,11 @@ def ask_question(
     _set_ollama_host(cfg["ollama_url"])
     if client is None:
         client = get_chroma_client(state_dir)
-    top_k = int(cfg.get("top_k", 12))
+    top_k = int(cfg.get("top_k", 20))
     max_chars = int(cfg.get("max_context_chars", 24000))
+    max_distance: Optional[float] = cfg.get("max_distance")
+    if max_distance is not None:
+        max_distance = float(max_distance)
 
     if collection_filter and collection_filter not in cfg["collections"]:
         console.print(f"[red]Unknown collection:[/red] {collection_filter}")
@@ -939,12 +966,22 @@ def ask_question(
     for name in collections:
         chroma_coll = get_collection(client, name)
         try:
-            res = chroma_coll.query(query_embeddings=[q_embedding], n_results=top_k)
+            res = chroma_coll.query(
+                query_embeddings=[q_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "ids", "distances"],
+            )
         except Exception:
             continue
-        all_docs.extend(res.get("documents", [[]])[0])
-        all_metas.extend(res.get("metadatas", [[]])[0])
-        all_ids.extend(res.get("ids", [[]])[0])
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        ids = res.get("ids", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        for doc, meta, cid, dist in zip(docs, metas, ids, dists):
+            if max_distance is None or dist <= max_distance:
+                all_docs.append(doc)
+                all_metas.append(meta)
+                all_ids.append(cid)
 
     if not all_docs:
         console.print("[yellow]No relevant documents found in the index.[/yellow]")
