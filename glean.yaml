@@ -154,7 +154,7 @@ collections:
 
   code_docs:
     paths:
-      - ~/code/ansible-playbooks
+      - ~/code/playbooks
       - ~/code/app.fitter.live
       - ~/code/app.jalalio.com
       - ~/code/app.pollzapper.com
